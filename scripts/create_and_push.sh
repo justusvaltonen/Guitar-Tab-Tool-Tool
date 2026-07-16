@@ -4,10 +4,10 @@
 
 set -euo pipefail
 
-REPO_NAME="${1:-generic-testing-repo-name}"
-DESCRIPTION="${2:-A test repository for automation}"
+REPO_NAME="${1:-guitar-tab-tool-tool}"
+DESCRIPTION="${2:-A lightweight command-line toolkit for working with guitar tablature}"
 
-echo "🚀 Creating repo: justusvaltonen/$REPO_NAME"
+echo "🚀 Setting up repo: justusvaltonen/$REPO_NAME"
 
 # Validate token is set
 if [ -z "${GITHUB_TOKEN:-}" ]; then
@@ -16,41 +16,51 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     exit 1
 fi
 
-# Create repo via GitHub API
-RESPONSE=$(curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
+# Check if repo already exists
+CHECK_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
   -H "Accept: application/vnd.github+json" \
-  https://api.github.com/user/repos \
-  -d "{
-    \"name\": \"$REPO_NAME\",
-    \"description\": \"$DESCRIPTION\",
-    \"private\": false,
-    \"auto_init\": false
-  }")
+  "https://api.github.com/repos/justusvaltonen/$REPO_NAME")
 
-# Check if creation succeeded
-if echo "$RESPONSE" | grep -q '"message":.*"Validation Failed"'; then
-    echo "❌ Failed to create repo:"
-    echo "$RESPONSE" | python3 -m json.tool
-    exit 1
+if echo "$CHECK_RESPONSE" | grep -q '"full_name":'; then
+    echo "ℹ️ Repository already exists, using existing..."
+    REPO_URL="https://github.com/justusvaltonen/$REPO_NAME"
+else
+    # Create repo via GitHub API
+    RESPONSE=$(curl -s -X POST \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      https://api.github.com/user/repos \
+      -d "{
+        \"name\": \"$REPO_NAME\",
+        \"description\": \"$DESCRIPTION\",
+        \"private\": false,
+        \"auto_init\": false
+      }")
+
+    # Check if creation succeeded
+    if echo "$RESPONSE" | grep -q '"message":.*"Validation Failed"'; then
+        echo "❌ Failed to create repo:"
+        echo "$RESPONSE" | python3 -m json.tool
+        exit 1
+    fi
+
+    # Get the clone URL
+    REPO_URL=$(echo "$RESPONSE" | grep -o '\"clone_url\":\"[^\"]*\"' | cut -d'"' -f4)
+    echo "✅ Repo created: $REPO_URL"
 fi
 
-# Get the clone URL
-CLONE_URL=$(echo "$RESPONSE" | grep -o '"clone_url":"[^"]*"' | cut -d'"' -f4)
-echo "✅ Repo created: $CLONE_URL"
-
-# Initialize local repo if not already done
+# Initialize Git repo if not already done
 if [ ! -d ".git" ]; then
-    git init
-    git add .
-    git commit -m "Initial commit"
+    git init -b main
+    git remote add origin "$REPO_URL"
 fi
 
-# Add remote and push
-git remote remove origin 2>/dev/null || true
-git remote add origin "$CLONE_URL"
-git branch -M main
-git push -u origin main
+# Force HTTPS push using token in URL
+echo "📦 Pushing to: $REPO_URL"
+git push "https://$GITHUB_TOKEN@github.com/justusvaltonen/$REPO_NAME" main 2>/dev/null || {
+    echo "❌ Git push failed. Ensure the token has repo:write permissions."
+    exit 1
+}
 
-echo "🎉 Successfully pushed to: $CLONE_URL"
+echo "🎉 Successfully pushed to: $REPO_URL"
 echo "📝 To update later: git push origin main"
