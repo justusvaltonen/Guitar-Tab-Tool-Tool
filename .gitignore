@@ -22,4 +22,4 @@ assets/*.sf2
 Thumbs.db
 
 # Logs
-*.log
+*.log.env

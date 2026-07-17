@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Play guitar ASCII tab files by converting to MIDI and synthesizing via FluidSynth."""
-
 import sys
 import os
 import tempfile
@@ -27,9 +26,7 @@ GUITAR_PROGRAM = 25
 
 def download_soundfont(url=SOUNDFONT_URL, path=SOUNDFONT_PATH):
     """Download soundfont if it doesn't exist or is invalid."""
-    # Determine if source is a URL or local path
     if url.startswith(('http://', 'https://')):
-        # Remote URL
         if os.path.exists(path) and os.path.getsize(path) > 100000:
             print(f"SoundFont found at: {path}")
             return path
@@ -43,79 +40,95 @@ def download_soundfont(url=SOUNDFONT_URL, path=SOUNDFONT_PATH):
             print(f"Error downloading SoundFont: {e}")
             sys.exit(1)
     else:
-        # Local file path
         if os.path.isfile(url):
             if os.path.getsize(url) > 100000:
-                # Already valid
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 if not os.path.exists(path) or os.path.getsize(path) <= 100000:
                     shutil.copy(url, path)
                 print(f"SoundFont found at: {path}")
                 return path
             else:
-                # Copy from source to assets path
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 shutil.copy(url, path)
                 print(f"SoundFont copied from {url} to {path}")
                 return path
         else:
-            # Source does not exist; treat as URL? but not http(s) -> error
             print(f"Error: SoundFont source file not found: {url}")
             sys.exit(1)
 
-def parse_ascii_tab(lines):
-    """Parse simple ASCII guitar tab (6 lines). Returns a dict mapping string index (0-5, low E to high E) to list of (position, fret) tuples."""
-    if len(lines) < 6:
-        raise ValueError("Tab must have at least 6 lines")
-    # Find the actual tab lines (skip headers like "e|--0-2-3-")
+def parse_tab_lines(lines):
+    """Parse ASCII tab into valid note positions.
+    
+    Uses a robust regex-based approach to extract notes from guitar tabs.
+    Handles multi-section tabs, mixed formats, and various annotations.
+    Returns a dict mapping string index (0-5, low E to high E) to list of (position, fret) tuples.
+    """
+    import re
+    
+    if len(lines) == 0:
+        raise ValueError("Tab must have at least one line")
+    
+    # Find all lines that look like tab strings (start with string letter or pipe)
+    # Standard format: e|--0-1-2--| or just |--0-1-2--|
     tab_lines = []
     for line in lines:
         stripped = line.strip()
-        # Skip empty lines and comment/header lines
         if not stripped or stripped.startswith('#'):
             continue
-        # Look for lines that have the pipe character (standard tab format)
-        if '|' in stripped:
-            # Extract the part after the pipe
-            parts = stripped.split('|', 1)
-            if len(parts) > 1:
-                tab_lines.append(parts[1])
-        else:
-            # Could be a simple tab line without pipe
-            tab_lines.append(stripped)
-    # Take first 6 lines as strings
-    if len(tab_lines) < 6:
-        raise ValueError(f"Expected 6 tab lines, got {len(tab_lines)}")
-    tab_lines = tab_lines[:6]
-    # Parse each string
-    result = {}
-    for string_idx, line in enumerate(tab_lines):
-        notes = []
-        i = 0
-        while i < len(line):
-            char = line[i]
-            if char == '-':
-                # Empty string, skip
-                i += 1
-            elif char.isdigit():
-                # Found a fret number
-                fret = int(char)
-                # Find position by counting dashes before this note
-                pos = 0
-                j = 0
-                while j < i and line[j] != '|':
-                    if line[j] == '-':
-                        pos += 1
-                    j += 1
-                notes.append((pos, fret))
-                i += 1
-            elif char == '|':
-                # Bar line, skip
-                i += 1
+        # Check if this looks like a tab line
+        if '|' in stripped or re.match(r'^[eBgDaEsS]|[-0-9]', stripped):
+            if '|' in stripped:
+                tab_content = stripped.split('|', 1)[1]
             else:
-                i += 1
-        # Map string index: 0 = low E (6th string), 5 = high E (1st string)
-        result[5 - string_idx] = notes
+                tab_content = stripped
+            tab_lines.append(tab_content)
+    
+    if not tab_lines:
+        raise ValueError("No valid tab content found")
+    
+    # Parse each tab line - they should be in order e, B, G, D, A, E (high to low)
+    # For multi-measure tabs, the same 6 strings repeat
+    result = {i: [] for i in range(6)}  # 0=low E, 5=high E
+    
+    # Process lines in groups of 6
+    for group_start in range(0, len(tab_lines), 6):
+        group = tab_lines[group_start:group_start + 6]
+        if len(group) < 6:
+            # Handle incomplete groups - still process what we have
+            pass
+        
+        for line_idx, line_content in enumerate(group):
+            if line_idx >= 6:
+                break
+            
+            # String mapping: group[0] = e (high E, string 5), group[5] = E (low E, string 0)
+            string_idx = 5 - line_idx
+            
+            # Extract fret numbers with their positions
+            notes = []
+            pos = 0
+            i = 0
+            while i < len(line_content):
+                char = line_content[i]
+                if char == '-':
+                    pos += 1
+                    i += 1
+                elif char.isdigit():
+                    # Read all consecutive digits for multi-digit fret numbers
+                    start = i
+                    while i < len(line_content) and line_content[i].isdigit():
+                        i += 1
+                    fret = int(line_content[start:i])
+                    # Only record valid frets (0-24 for guitar)
+                    if 0 <= fret <= 24:
+                        notes.append((pos, fret))
+                elif char == '|':
+                    i += 1
+                else:
+                    i += 1
+            
+            result[string_idx].extend(notes)
+    
     return result
 
 def tab_to_midi(tab_data, output_path, tempo=120, note_duration=0.5):
@@ -123,41 +136,34 @@ def tab_to_midi(tab_data, output_path, tempo=120, note_duration=0.5):
     mid = MidiFile()
     track = MidiTrack()
     mid.tracks.append(track)
-    # Set tempo (mido.tempo2bpm converts BPM to microseconds per beat, we need the reverse)
     track.append(MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo)))
-    # Time signature
     track.append(MetaMessage('time_signature', numerator=4, denominator=4))
-    # Program change for Nylon Guitar
     track.append(Message('program_change', program=GUITAR_PROGRAM, time=0))
-    # Collect all notes with their positions
+    
     all_notes = []
     for string_idx in range(6):
         notes = tab_data.get(string_idx, [])
         base_note = STRING_TUNING[string_idx]
         for pos, fret in notes:
             if fret == 0:
-                # Open string - use the base note
                 note_num = base_note
             else:
-                # Calculate MIDI note for the fret
                 note_num = base_note + fret
-            all_notes.append((pos, note_num))
-    # Sort notes by position for proper delta timing
+            # Validate MIDI note number (0-127)
+            if 0 <= note_num <= 127:
+                all_notes.append((pos, note_num))
+    
     all_notes.sort(key=lambda x: x[0])
-    # MIDI ticks per beat
     ticks_per_beat = mid.ticks_per_beat
     last_pos = 0
-    # Process each note with proper delta timing
+    
     for pos, note_num in all_notes:
-        # Delta time from previous note
         delta_pos = pos - last_pos
-        delta_time = int(delta_pos * (ticks_per_beat / 4))  # 4 positions per beat
-        # Add note on
-        track.append(Message('note_on', note=note_num, velocity=64, time=delta_time))
-        # Add note off after duration
+        delta_time = max(0, int(delta_pos * (ticks_per_beat / 4)))
+        track.append(Message('note_on', note=note_num, velocity=80, time=delta_time))
         track.append(Message('note_off', note=note_num, velocity=64, time=int(note_duration * ticks_per_beat)))
         last_pos = pos
-    # Write MIDI file
+    
     mid.save(output_path)
     return output_path
 
@@ -165,9 +171,9 @@ def render_wav(midi_path, soundfont_path, output_wav):
     """Render MIDI to WAV using FluidSynth."""
     try:
         result = subprocess.run(
-            ['fluidsynth', '-ni', '-F', output_wav, '-r', '44100', soundfont_path, midi_path],
+            ['fluidsynth', '-ni', '-F', output_wav, '-r', '44100', '-g', '2.0', soundfont_path, midi_path],
             capture_output=True,
-            text=True
+            text=True, timeout=30
         )
         if result.returncode != 0:
             print(f"FluidSynth error: {result.stderr}")
@@ -177,43 +183,45 @@ def render_wav(midi_path, soundfont_path, output_wav):
     except FileNotFoundError:
         print("Error: fluidsynth not found. Install it with: sudo apt-get install fluidsynth")
         return False
+    except subprocess.TimeoutExpired:
+        print("Error: FluidSynth timed out")
+        return False
 
 def play_tab_file(tab_path, output_wav=None):
     """Main function to process a tab file and produce a WAV."""
-    # Read the tab file
     with open(tab_path, 'r') as f:
         lines = f.readlines()
     print(f"Parsing tab file: {tab_path}")
-    print(f"Lines read: {len(lines)}")
-    # Parse the tab
+    
     try:
-        tab_data = parse_ascii_tab(lines)
+        tab_data = parse_tab_lines(lines)
     except ValueError as e:
         print(f"Error parsing tab: {e}")
         sys.exit(1)
-    print(f"Parsed {len(tab_data)} strings")
+    
+    total_notes = sum(len(notes) for notes in tab_data.values())
+    print(f"Parsed {total_notes} total notes across all strings")
     for string_idx, notes in tab_data.items():
         if notes:
-            print(f"  String {string_idx + 1}: {len(notes)} notes")
-    # Download soundfont if needed
+            print(f"  String {string_idx + 1} ({'E2ADEF'[string_idx]}): {len(notes)} notes")
+    
     soundfont = download_soundfont()
-    # Create temporary MIDI file
+    
     with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as tmp:
         midi_path = tmp.name
+    
     try:
-        # Convert to MIDI
         print("Creating MIDI file...")
         tab_to_midi(tab_data, midi_path)
         print(f"MIDI file created: {midi_path}")
-        # Determine output WAV path
+        
         if output_wav:
             wav_path = output_wav
         else:
             wav_path = os.path.join(os.path.dirname(tab_path), os.path.splitext(os.path.basename(tab_path))[0] + '.wav')
-        # Render WAV
+        
         render_wav(midi_path, soundfont, wav_path)
     finally:
-        # Clean up temporary MIDI file
         if os.path.exists(midi_path):
             os.unlink(midi_path)
 
@@ -222,15 +230,17 @@ def main():
         print("Usage: python play_tab.py <tab_file> [output.wav]")
         print("Example: python play_tab.py my_song.txt")
         sys.exit(1)
+    
     tab_file = sys.argv[1]
     if not os.path.exists(tab_file):
         print(f"Error: File not found: {tab_file}")
         sys.exit(1)
-    # Determine output WAV path
+    
     if len(sys.argv) >= 3:
         output_wav = sys.argv[2]
     else:
         output_wav = os.path.join(os.path.dirname(tab_file), os.path.splitext(os.path.basename(tab_file))[0] + '.wav')
+    
     play_tab_file(tab_file, output_wav)
 
 if __name__ == "__main__":
