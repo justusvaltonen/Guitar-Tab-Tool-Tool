@@ -4,31 +4,34 @@ Live Audio to Guitar Tab Transcriber
 Records from microphone, detects pitches, maps to guitar strings/frets, outputs ASCII tab.
 """
 
+import sys
 import numpy as np
-import pyaudio
 import librosa
 import pretty_midi
 from collections import deque
 import threading
 import time
-import sys
 
 # Guitar standard tuning (E2, A2, D3, G3, B3, E4) - low to high
+# String indices: 0=low E (6th string), 5=high E (1st string)
 GUITAR_TUNING = [
-    ("E", 82.41),   # String 6 (low E)
-    ("A", 110.00),  # String 5
-    ("D", 146.83),  # String 4
-    ("G", 196.00),  # String 3
-    ("B", 246.94),  # String 2
-    ("E", 329.63),  # String 1 (high E)
+    ("E", 82.41),   # String 0 (low E, 6th string)
+    ("A", 110.00),  # String 1 (5th string)
+    ("D", 146.83),  # String 2 (4th string)
+    ("G", 196.00),  # String 3 (3rd string)
+    ("B", 246.94),  # String 4 (2nd string)
+    ("E", 329.63),  # String 5 (high E, 1st string)
 ]
+
+# String names for display (high to low, as shown in tab)
+STRING_NAMES_DISPLAY = ['e', 'B', 'G', 'D', 'A', 'E']  # high E to low E
 
 # Fret frequencies relative to open string (12-EDO)
 FRET_RATIOS = [2 ** (i / 12) for i in range(25)]  # 0-24 frets
 
 SAMPLE_RATE = 44100
 CHUNK_SIZE = 2048  # ~46ms at 44.1kHz
-FORMAT = pyaudio.paFloat32
+FORMAT = None  # Will be set based on availability
 CHANNELS = 1
 
 # Audio buffer for pitch detection
@@ -40,21 +43,43 @@ last_pitch = None
 last_note_time = 0
 note_cooldown = 0.3  # seconds between note outputs
 
+# Try to import pyaudio, but make it optional
+try:
+    import pyaudio
+    HAS_PYAUDIO = True
+    FORMAT = pyaudio.paFloat32
+except ImportError:
+    HAS_PYAUDIO = False
+    print("Warning: pyaudio not available. Audio input will not work.")
+
 
 def freq_to_midi(freq):
-    """Convert frequency to MIDI note number."""
+    """Convert frequency to MIDI note number.
+    
+    MIDI note 69 = A4 = 440Hz
+    Formula: midi = 12 * log2(freq / 440) + 69
+    """
     if freq <= 0:
         return None
     return round(12 * np.log2(freq / 440.0) + 69)
 
 
 def midi_to_freq(midi):
-    """Convert MIDI note to frequency."""
+    """Convert MIDI note to frequency.
+    
+    Formula: freq = 440 * 2^((midi - 69) / 12)
+    """
     return 440.0 * (2 ** ((midi - 69) / 12))
 
 
 def find_closest_string_fret(target_freq):
-    """Find the closest guitar string/fret combination for a given frequency."""
+    """Find the closest guitar string/fret combination for a given frequency.
+    
+    Returns:
+        Tuple of (string_idx, fret, note_name, matched_freq) or None if no match
+        string_idx: 0-5 (0=low E, 5=high E)
+        fret: 0-24
+    """
     best_match = None
     best_error = float('inf')
     
@@ -73,7 +98,15 @@ def find_closest_string_fret(target_freq):
 
 
 def detect_pitch_librosa(y, sr):
-    """Detect fundamental frequency using librosa's pyin."""
+    """Detect fundamental frequency using librosa's pyin.
+    
+    Args:
+        y: Audio signal (numpy array)
+        sr: Sample rate
+    
+    Returns:
+        Fundamental frequency in Hz, or None if not detected
+    """
     try:
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y, fmin=librosa.note_to_hz('E2'), fmax=librosa.note_to_hz('E6'),
@@ -82,14 +115,22 @@ def detect_pitch_librosa(y, sr):
         # Get median of voiced frames
         voiced_f0 = f0[voiced_flag]
         if len(voiced_f0) > 0:
-            return np.median(voiced_f0)
+            return float(np.median(voiced_f0))
     except Exception:
         pass
     return None
 
 
 def detect_pitch_autocorr(y, sr):
-    """Fallback pitch detection using autocorrelation."""
+    """Fallback pitch detection using autocorrelation.
+    
+    Args:
+        y: Audio signal (numpy array)
+        sr: Sample rate
+    
+    Returns:
+        Fundamental frequency in Hz, or None if not detected
+    """
     # Normalize
     y = y - np.mean(y)
     if np.max(np.abs(y)) > 0:
@@ -120,7 +161,11 @@ def audio_callback(in_data, frame_count, time_info, status):
 
 
 def process_audio():
-    """Process audio buffer and detect notes."""
+    """Process audio buffer and detect notes.
+    
+    Returns:
+        Dict with note info or None if no note detected
+    """
     global last_pitch, last_note_time
     
     with buffer_lock:
@@ -152,7 +197,7 @@ def process_audio():
     if match:
         string_idx, fret, note_name, matched_freq = match
         return {
-            'string': 6 - string_idx,  # 1=high E, 6=low E
+            'string': string_idx,  # 0-5 (0=low E, 5=high E)
             'fret': fret,
             'note': note_name,
             'freq': pitch,
@@ -162,22 +207,30 @@ def process_audio():
 
 
 def format_tab_line(note_info):
-    """Format a single note as ASCII tab line."""
+    """Format a single note as ASCII tab line.
+    
+    Args:
+        note_info: Dict with 'string', 'fret', 'note', 'freq', 'matched_freq'
+    
+    Returns:
+        Formatted string with tab representation
+    """
     if note_info is None:
         return ""
     
-    string_num = note_info['string']
+    string_idx = note_info['string']  # 0-5 (0=low E, 5=high E)
     fret = note_info['fret']
     note_name = note_info['note']
     
     # Create tab representation
-    # Strings: e B G D A E (high to low)
-    strings = ['e', 'B', 'G', 'D', 'A', 'E']
-    
+    # In tab notation: top line = high E (string 5), bottom line = low E (string 0)
+    # So we need to reverse the string order for display
     lines = []
-    for i, s in enumerate(strings):
-        string_idx = i + 1  # top 'e' (high E) = string 1, bottom 'E' (low E) = string 6
-        if string_idx == string_num:
+    for i, s in enumerate(STRING_NAMES_DISPLAY):
+        # i=0 is 'e' (high E, string 5), i=5 is 'E' (low E, string 0)
+        # display_string_idx = 5 - i (5=high E, 0=low E)
+        display_string_idx = 5 - i
+        if string_idx == display_string_idx:
             fret_str = str(fret).rjust(2)
             lines.append(f"{s}|---{fret_str}---|")
         else:
@@ -197,7 +250,33 @@ def clear_screen():
     print("\033[2J\033[H", end="")
 
 
+def list_audio_devices():
+    """List available audio input devices.
+    
+    Returns:
+        List of (index, name) tuples for input devices
+    """
+    if not HAS_PYAUDIO:
+        return []
+    
+    p = pyaudio.PyAudio()
+    devices = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0:
+            devices.append((i, info['name']))
+    p.terminate()
+    return devices
+
+
 def main():
+    """Main entry point for live transcription."""
+    if not HAS_PYAUDIO:
+        print("Error: pyaudio is required for live audio input.")
+        print("Install it with: pip install pyaudio")
+        print("Note: On Linux, you may need: sudo apt-get install portaudio19-dev")
+        sys.exit(1)
+    
     print("=" * 50)
     print("  Live Audio -> Guitar Tab Transcriber")
     print("=" * 50)
@@ -205,14 +284,11 @@ def main():
     print("  Standard tuning: E A D G B E (low to high)")
     print("  String 1 = high E, String 6 = low E\n")
     
-    p = pyaudio.PyAudio()
-    
     # List input devices
+    devices = list_audio_devices()
     print("Available input devices:")
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info['maxInputChannels'] > 0:
-            print(f"  [{i}] {info['name']}")
+    for idx, name in devices:
+        print(f"  [{idx}] {name}")
     
     device_index = None
     try:
@@ -221,6 +297,8 @@ def main():
             device_index = int(choice)
     except (ValueError, KeyboardInterrupt):
         pass
+    
+    p = pyaudio.PyAudio()
     
     stream = p.open(
         format=FORMAT,
